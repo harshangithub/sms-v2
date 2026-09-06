@@ -413,6 +413,7 @@ class LoginWindow:
     def __init__(self, root, db_manager):
         self.root = root
         self.db = db_manager
+        self.dashboard = None
         self.root.title("Student Management System")
         self.root.geometry("460x300")
         self.root.minsize(430, 280)
@@ -468,26 +469,53 @@ class LoginWindow:
             return
         if self.db.verify_admin_password(password):
             self.status.set("Admin login successful")
-            AdminDashboard(self.root, self.db)
+            self._open_dashboard(AdminDashboard)
         else:
             self.status.set("Invalid admin password")
             messagebox.showerror("Login Failed", "Invalid admin password.")
 
     def student_login(self):
         self.status.set("Student login successful")
-        StudentDashboard(self.root, self.db)
+        self._open_dashboard(StudentDashboard)
+
+    def _open_dashboard(self, dashboard_cls):
+        if self.dashboard and self.dashboard.winfo_exists():
+            self._focus_window(self.dashboard)
+            return
+        self.root.withdraw()
+        self.dashboard = dashboard_cls(self.root, self.db, on_logout=self.logout)
+        self._focus_window(self.dashboard)
+
+    def _focus_window(self, window):
+        if not window or not window.winfo_exists():
+            return
+        window.lift()
+        try:
+            window.focus_force()
+        except tk.TclError:
+            pass
+
+    def logout(self):
+        if self.dashboard and self.dashboard.winfo_exists():
+            self.dashboard.destroy()
+        self.dashboard = None
+        self.password_var.set("")
+        self.root.deiconify()
+        self._focus_window(self.root)
+        self.status.set("Ready")
 
 
 class BaseDashboard(tk.Toplevel):
-    def __init__(self, master, db_manager, title, can_manage=False):
+    def __init__(self, master, db_manager, title, can_manage=False, on_logout=None):
         super().__init__(master)
         self.db = db_manager
         self.can_manage = can_manage
+        self.on_logout = on_logout
         self.title(title)
         self.geometry("1200x700")
         self.minsize(980, 580)
         self.configure(bg="#eef1f5")
-        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.protocol("WM_DELETE_WINDOW", self.logout)
         self.status_var = tk.StringVar(value="Ready")
         self.search_field = tk.StringVar(value="Name")
         self.search_text = tk.StringVar()
@@ -597,7 +625,7 @@ class BaseDashboard(tk.Toplevel):
         ttk.Button(bottom, text="Refresh Rankings", command=self.recalculate_rankings).pack(
             side="left", padx=(0, 8)
         )
-        ttk.Button(bottom, text="Close", command=self._close).pack(side="right")
+        ttk.Button(bottom, text="Logout", command=self.logout).pack(side="right")
 
         ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w").pack(
             side="bottom", fill="x"
@@ -619,6 +647,12 @@ class BaseDashboard(tk.Toplevel):
                     return
 
     def _close(self):
+        self.logout()
+
+    def logout(self):
+        if callable(self.on_logout):
+            self.on_logout()
+            return
         self.destroy()
 
     def refresh_table(self):
@@ -739,8 +773,10 @@ class BaseDashboard(tk.Toplevel):
 
 
 class AdminDashboard(BaseDashboard):
-    def __init__(self, master, db_manager):
-        super().__init__(master, db_manager, "Admin Dashboard", can_manage=True)
+    def __init__(self, master, db_manager, on_logout=None):
+        super().__init__(
+            master, db_manager, "Admin Dashboard", can_manage=True, on_logout=on_logout
+        )
         self.status_var.set("Admin dashboard ready")
 
     def add_multiple_students(self):
@@ -751,12 +787,31 @@ class AdminDashboard(BaseDashboard):
 
 
 class StudentDashboard(BaseDashboard):
-    def __init__(self, master, db_manager):
-        super().__init__(master, db_manager, "Student Dashboard", can_manage=False)
+    def __init__(self, master, db_manager, on_logout=None):
+        super().__init__(
+            master, db_manager, "Student Dashboard", can_manage=False, on_logout=on_logout
+        )
         self.status_var.set("Student dashboard ready")
 
 
-class StudentForm(tk.Toplevel):
+class ManagedChildWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.parent = master
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self.close_window)
+
+    def close_window(self):
+        self.destroy()
+        if self.parent and self.parent.winfo_exists():
+            self.parent.lift()
+            try:
+                self.parent.focus_force()
+            except tk.TclError:
+                pass
+
+
+class StudentForm(ManagedChildWindow):
     def __init__(self, master, db_manager, student_data=None, on_save=None):
         super().__init__(master)
         self.db = db_manager
@@ -799,7 +854,7 @@ class StudentForm(tk.Toplevel):
         button_frame = ttk.Frame(container)
         button_frame.grid(row=len(fields), column=0, columnspan=2, pady=18, sticky="e")
         ttk.Button(button_frame, text="Save", command=self.save).pack(side="left", padx=(0, 8))
-        ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="left")
+        ttk.Button(button_frame, text="Cancel", command=self.close_window).pack(side="left")
 
     def _populate_form(self):
         self.vars["roll_no"].set(self.student_data[1])
@@ -854,12 +909,12 @@ class StudentForm(tk.Toplevel):
             if self.on_save:
                 self.on_save()
             messagebox.showinfo("Success", msg)
-            self.destroy()
+            self.close_window()
         else:
             messagebox.showerror("Error", msg)
 
 
-class MultipleStudentsWindow(tk.Toplevel):
+class MultipleStudentsWindow(ManagedChildWindow):
     def __init__(self, master, db_manager, on_save=None):
         super().__init__(master)
         self.db = db_manager
@@ -915,7 +970,7 @@ class MultipleStudentsWindow(tk.Toplevel):
         ttk.Button(buttons, text="Save All Students", command=self.save_all_students).pack(
             side="right", padx=(6, 0)
         )
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Close", command=self.close_window).pack(side="right")
 
         table_frame = ttk.Frame(main)
         table_frame.pack(expand=True, fill="both")
@@ -1110,7 +1165,7 @@ class MultipleStudentsWindow(tk.Toplevel):
             messagebox.showinfo("Success", f"Successfully added {added_count} student(s).")
 
 
-class ReportCardWindow(tk.Toplevel):
+class ReportCardWindow(ManagedChildWindow):
     def __init__(self, master, student):
         super().__init__(master)
         self.student = student
@@ -1155,7 +1210,7 @@ class ReportCardWindow(tk.Toplevel):
         ttk.Button(button_frame, text="Print Report Card", command=self.print_report).pack(
             side="left"
         )
-        ttk.Button(button_frame, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(button_frame, text="Close", command=self.close_window).pack(side="right")
 
     def print_report(self):
         file_name = f"report_card_{self.student[1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -1196,7 +1251,7 @@ class ReportCardWindow(tk.Toplevel):
         messagebox.showinfo("Printed", f"Report card saved to:\n{file_path}")
 
 
-class ChangePasswordWindow(tk.Toplevel):
+class ChangePasswordWindow(ManagedChildWindow):
     def __init__(self, master, db_manager):
         super().__init__(master)
         self.db = db_manager
@@ -1227,7 +1282,7 @@ class ChangePasswordWindow(tk.Toplevel):
         buttons = ttk.Frame(frame)
         buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=12)
         ttk.Button(buttons, text="Update", command=self.update_password).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="left")
+        ttk.Button(buttons, text="Close", command=self.close_window).pack(side="left")
 
     def update_password(self):
         current = self.current.get().strip()
@@ -1246,7 +1301,7 @@ class ChangePasswordWindow(tk.Toplevel):
 
         self.db.update_admin_password(new_pass)
         messagebox.showinfo("Success", "Password updated successfully.")
-        self.destroy()
+        self.close_window()
 
 
 def main():

@@ -1,13 +1,20 @@
 import os
 import csv
 import sqlite3
+from collections import defaultdict
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 
 DB_FILE = "sms.db"
-SUBJECTS = ["english", "maths", "science", "social", "computer"]
+SUBJECT_FIELDS = [
+    ("physics", "Physics"),
+    ("chemistry", "Chemistry"),
+    ("maths", "Maths"),
+    ("english", "English"),
+    ("computer_science", "Computer Science"),
+]
 
 
 class DatabaseManager:
@@ -17,6 +24,27 @@ class DatabaseManager:
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
+
+    def _create_students_table(self, cursor, table_name="students"):
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                roll_no TEXT UNIQUE NOT NULL,
+                student_name TEXT NOT NULL,
+                class_name TEXT NOT NULL,
+                section TEXT NOT NULL,
+                physics_marks REAL NOT NULL,
+                chemistry_marks REAL NOT NULL,
+                maths_marks REAL NOT NULL,
+                english_marks REAL NOT NULL,
+                computer_science_marks REAL NOT NULL,
+                total_marks REAL NOT NULL,
+                average_marks REAL NOT NULL,
+                overall_rank INTEGER DEFAULT 0
+            )
+            """
+        )
 
     def _initialize_database(self):
         with self._connect() as conn:
@@ -29,29 +57,99 @@ class DatabaseManager:
                 )
                 """
             )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS students (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    roll_no TEXT UNIQUE NOT NULL,
-                    student_name TEXT NOT NULL,
-                    class_name TEXT NOT NULL,
-                    section TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    english_marks REAL NOT NULL,
-                    maths_marks REAL NOT NULL,
-                    science_marks REAL NOT NULL,
-                    social_marks REAL NOT NULL,
-                    computer_marks REAL NOT NULL,
-                    average_marks REAL NOT NULL,
-                    overall_rank INTEGER DEFAULT 0
-                )
-                """
-            )
+
+            students_table = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='students'"
+            ).fetchone()
+            if not students_table:
+                self._create_students_table(cursor)
+            else:
+                self._migrate_students_table(cursor)
+
             admin_count = cursor.execute("SELECT COUNT(*) FROM admin").fetchone()[0]
             if admin_count == 0:
                 cursor.execute("INSERT INTO admin (password) VALUES (?)", ("admin",))
             conn.commit()
+
+    def _migrate_students_table(self, cursor):
+        cols_info = cursor.execute("PRAGMA table_info(students)").fetchall()
+        existing_cols = [col[1] for col in cols_info]
+        target_cols = {
+            "id",
+            "roll_no",
+            "student_name",
+            "class_name",
+            "section",
+            "physics_marks",
+            "chemistry_marks",
+            "maths_marks",
+            "english_marks",
+            "computer_science_marks",
+            "total_marks",
+            "average_marks",
+            "overall_rank",
+        }
+        legacy_cols = {"phone", "science_marks", "social_marks", "computer_marks"}
+
+        if set(existing_cols) == target_cols:
+            return
+
+        if target_cols.issubset(set(existing_cols)) and not legacy_cols.intersection(existing_cols):
+            return
+
+        self._create_students_table(cursor, "students_new")
+
+        def col_expr(primary, fallback=None, default="0"):
+            if primary in existing_cols:
+                return f"COALESCE({primary}, 0)"
+            if fallback and fallback in existing_cols:
+                return f"COALESCE({fallback}, 0)"
+            return default
+
+        physics_expr = col_expr("physics_marks", fallback="science_marks")
+        chemistry_expr = col_expr("chemistry_marks", fallback="social_marks")
+        maths_expr = col_expr("maths_marks")
+        english_expr = col_expr("english_marks")
+        computer_science_expr = col_expr("computer_science_marks", fallback="computer_marks")
+
+        total_expr = (
+            "COALESCE(total_marks, 0)"
+            if "total_marks" in existing_cols
+            else f"(({physics_expr}) + ({chemistry_expr}) + ({maths_expr}) + ({english_expr}) + ({computer_science_expr}))"
+        )
+        average_expr = (
+            "COALESCE(average_marks, 0)"
+            if "average_marks" in existing_cols
+            else f"(({total_expr}) / 5.0)"
+        )
+        rank_expr = "COALESCE(overall_rank, 0)" if "overall_rank" in existing_cols else "0"
+
+        cursor.execute(
+            f"""
+            INSERT INTO students_new (
+                id, roll_no, student_name, class_name, section,
+                physics_marks, chemistry_marks, maths_marks, english_marks,
+                computer_science_marks, total_marks, average_marks, overall_rank
+            )
+            SELECT
+                id,
+                COALESCE(roll_no, ''),
+                COALESCE(student_name, ''),
+                COALESCE(class_name, ''),
+                COALESCE(section, ''),
+                {physics_expr},
+                {chemistry_expr},
+                {maths_expr},
+                {english_expr},
+                {computer_science_expr},
+                {total_expr},
+                {average_expr},
+                {rank_expr}
+            FROM students
+            """
+        )
+        cursor.execute("DROP TABLE students")
+        cursor.execute("ALTER TABLE students_new RENAME TO students")
 
     def verify_admin_password(self, password):
         with self._connect() as conn:
@@ -68,20 +166,21 @@ class DatabaseManager:
             )
             conn.commit()
 
-    def _calculate_average(self, student):
-        total = sum(float(student[f"{subject}_marks"]) for subject in SUBJECTS)
-        return round(total / len(SUBJECTS), 2)
+    def _calculate_totals(self, student):
+        total = sum(float(student[f"{subject}_marks"]) for subject, _ in SUBJECT_FIELDS)
+        average = round(total / len(SUBJECT_FIELDS), 2)
+        return round(total, 2), average
 
     def add_student(self, student):
-        student["average_marks"] = self._calculate_average(student)
+        student["total_marks"], student["average_marks"] = self._calculate_totals(student)
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
                     INSERT INTO students (
-                        roll_no, student_name, class_name, section, phone,
-                        english_marks, maths_marks, science_marks, social_marks,
-                        computer_marks, average_marks
+                        roll_no, student_name, class_name, section,
+                        physics_marks, chemistry_marks, maths_marks, english_marks,
+                        computer_science_marks, total_marks, average_marks
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
@@ -89,12 +188,12 @@ class DatabaseManager:
                         student["student_name"],
                         student["class_name"],
                         student["section"],
-                        student["phone"],
-                        student["english_marks"],
+                        student["physics_marks"],
+                        student["chemistry_marks"],
                         student["maths_marks"],
-                        student["science_marks"],
-                        student["social_marks"],
-                        student["computer_marks"],
+                        student["english_marks"],
+                        student["computer_science_marks"],
+                        student["total_marks"],
                         student["average_marks"],
                     ),
                 )
@@ -104,16 +203,68 @@ class DatabaseManager:
         except sqlite3.IntegrityError:
             return False, "Roll number already exists."
 
+    def add_students_bulk(self, students):
+        if not students:
+            return 0
+
+        prepared = []
+        for student in students:
+            total_marks, average_marks = self._calculate_totals(student)
+            prepared.append(
+                (
+                    student["roll_no"],
+                    student["student_name"],
+                    student["class_name"],
+                    student["section"],
+                    student["physics_marks"],
+                    student["chemistry_marks"],
+                    student["maths_marks"],
+                    student["english_marks"],
+                    student["computer_science_marks"],
+                    total_marks,
+                    average_marks,
+                )
+            )
+
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO students (
+                    roll_no, student_name, class_name, section,
+                    physics_marks, chemistry_marks, maths_marks, english_marks,
+                    computer_science_marks, total_marks, average_marks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                prepared,
+            )
+            conn.commit()
+
+        self.recalculate_rankings()
+        return len(prepared)
+
+    def find_existing_roll_numbers(self, roll_numbers):
+        unique_rolls = sorted({roll.strip() for roll in roll_numbers if roll and roll.strip()})
+        if not unique_rolls:
+            return set()
+
+        placeholders = ", ".join("?" for _ in unique_rolls)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT roll_no FROM students WHERE roll_no IN ({placeholders})",
+                unique_rolls,
+            ).fetchall()
+        return {row[0] for row in rows}
+
     def update_student(self, student_id, student):
-        student["average_marks"] = self._calculate_average(student)
+        student["total_marks"], student["average_marks"] = self._calculate_totals(student)
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
                     UPDATE students
-                    SET roll_no=?, student_name=?, class_name=?, section=?, phone=?,
-                        english_marks=?, maths_marks=?, science_marks=?, social_marks=?,
-                        computer_marks=?, average_marks=?
+                    SET roll_no=?, student_name=?, class_name=?, section=?,
+                        physics_marks=?, chemistry_marks=?, maths_marks=?, english_marks=?,
+                        computer_science_marks=?, total_marks=?, average_marks=?
                     WHERE id=?
                     """,
                     (
@@ -121,12 +272,12 @@ class DatabaseManager:
                         student["student_name"],
                         student["class_name"],
                         student["section"],
-                        student["phone"],
-                        student["english_marks"],
+                        student["physics_marks"],
+                        student["chemistry_marks"],
                         student["maths_marks"],
-                        student["science_marks"],
-                        student["social_marks"],
-                        student["computer_marks"],
+                        student["english_marks"],
+                        student["computer_science_marks"],
+                        student["total_marks"],
                         student["average_marks"],
                         student_id,
                     ),
@@ -147,9 +298,9 @@ class DatabaseManager:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                SELECT id, roll_no, student_name, class_name, section, phone,
-                       english_marks, maths_marks, science_marks, social_marks,
-                       computer_marks, average_marks, overall_rank
+                SELECT id, roll_no, student_name, class_name, section,
+                       physics_marks, chemistry_marks, maths_marks, english_marks,
+                       computer_science_marks, total_marks, average_marks, overall_rank
                 FROM students
                 ORDER BY overall_rank ASC, student_name ASC
                 """
@@ -169,9 +320,9 @@ class DatabaseManager:
         with self._connect() as conn:
             cursor = conn.execute(
                 f"""
-                SELECT id, roll_no, student_name, class_name, section, phone,
-                       english_marks, maths_marks, science_marks, social_marks,
-                       computer_marks, average_marks, overall_rank
+                SELECT id, roll_no, student_name, class_name, section,
+                       physics_marks, chemistry_marks, maths_marks, english_marks,
+                       computer_science_marks, total_marks, average_marks, overall_rank
                 FROM students
                 WHERE {column} LIKE ?
                 ORDER BY overall_rank ASC, student_name ASC
@@ -184,9 +335,9 @@ class DatabaseManager:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                SELECT id, roll_no, student_name, class_name, section, phone,
-                       english_marks, maths_marks, science_marks, social_marks,
-                       computer_marks, average_marks, overall_rank
+                SELECT id, roll_no, student_name, class_name, section,
+                       physics_marks, chemistry_marks, maths_marks, english_marks,
+                       computer_science_marks, total_marks, average_marks, overall_rank
                 FROM students
                 WHERE id=?
                 """,
@@ -241,12 +392,12 @@ class DatabaseManager:
             "Name",
             "Class",
             "Section",
-            "Phone",
-            "English",
+            "Physics",
+            "Chemistry",
             "Maths",
-            "Science",
-            "Social",
-            "Computer",
+            "English",
+            "Computer Science",
+            "Total Marks",
             "Average",
             "Rank",
         ]
@@ -388,6 +539,9 @@ class BaseDashboard(tk.Toplevel):
             ttk.Button(controls, text="Add Student", command=self.add_student).pack(
                 side="right", padx=(6, 0)
             )
+            ttk.Button(controls, text="Add Multiple Students", command=self.add_multiple_students).pack(
+                side="right", padx=(6, 0)
+            )
             ttk.Button(controls, text="Edit Student", command=self.edit_student).pack(
                 side="right", padx=(6, 0)
             )
@@ -398,7 +552,7 @@ class BaseDashboard(tk.Toplevel):
         table_frame = ttk.Frame(main)
         table_frame.pack(expand=True, fill="both")
 
-        columns = ["id", "roll", "name", "class", "section", "phone", "average", "rank"]
+        columns = ["id", "roll", "name", "class", "section", "total", "average", "rank"]
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         headers = {
             "id": "ID",
@@ -406,7 +560,7 @@ class BaseDashboard(tk.Toplevel):
             "name": "Name",
             "class": "Class",
             "section": "Section",
-            "phone": "Phone",
+            "total": "Total",
             "average": "Average",
             "rank": "Rank",
         }
@@ -416,7 +570,7 @@ class BaseDashboard(tk.Toplevel):
             "name": 220,
             "class": 100,
             "section": 100,
-            "phone": 140,
+            "total": 100,
             "average": 100,
             "rank": 80,
         }
@@ -495,7 +649,7 @@ class BaseDashboard(tk.Toplevel):
                     row[2],
                     row[3],
                     row[4],
-                    row[5],
+                    f"{float(row[10]):.2f}",
                     f"{float(row[11]):.2f}",
                     row[12],
                 ),
@@ -516,6 +670,9 @@ class BaseDashboard(tk.Toplevel):
 
     def add_student(self):
         StudentForm(self, self.db, on_save=self.refresh_table)
+
+    def add_multiple_students(self):
+        messagebox.showinfo("Access Denied", "This action is only available for admin.")
 
     def edit_student(self):
         student_id = self.get_selected_student_id()
@@ -586,6 +743,9 @@ class AdminDashboard(BaseDashboard):
         super().__init__(master, db_manager, "Admin Dashboard", can_manage=True)
         self.status_var.set("Admin dashboard ready")
 
+    def add_multiple_students(self):
+        MultipleStudentsWindow(self, self.db, on_save=self.refresh_table)
+
     def change_password(self):
         ChangePasswordWindow(self, self.db)
 
@@ -603,8 +763,8 @@ class StudentForm(tk.Toplevel):
         self.student_data = student_data
         self.on_save = on_save
         self.title("Edit Student" if student_data else "Add Student")
-        self.geometry("520x620")
-        self.minsize(500, 600)
+        self.geometry("520x590")
+        self.minsize(500, 560)
         self.resizable(True, True)
         self.vars = {}
         self._build_ui()
@@ -620,12 +780,11 @@ class StudentForm(tk.Toplevel):
             ("student_name", "Name"),
             ("class_name", "Class"),
             ("section", "Section"),
-            ("phone", "Phone Number"),
-            ("english_marks", "English Marks"),
+            ("physics_marks", "Physics Marks"),
+            ("chemistry_marks", "Chemistry Marks"),
             ("maths_marks", "Maths Marks"),
-            ("science_marks", "Science Marks"),
-            ("social_marks", "Social Marks"),
-            ("computer_marks", "Computer Marks"),
+            ("english_marks", "English Marks"),
+            ("computer_science_marks", "Computer Science Marks"),
         ]
 
         for index, (key, label) in enumerate(fields):
@@ -647,25 +806,20 @@ class StudentForm(tk.Toplevel):
         self.vars["student_name"].set(self.student_data[2])
         self.vars["class_name"].set(self.student_data[3])
         self.vars["section"].set(self.student_data[4])
-        self.vars["phone"].set(self.student_data[5])
-        self.vars["english_marks"].set(self.student_data[6])
+        self.vars["physics_marks"].set(self.student_data[5])
+        self.vars["chemistry_marks"].set(self.student_data[6])
         self.vars["maths_marks"].set(self.student_data[7])
-        self.vars["science_marks"].set(self.student_data[8])
-        self.vars["social_marks"].set(self.student_data[9])
-        self.vars["computer_marks"].set(self.student_data[10])
+        self.vars["english_marks"].set(self.student_data[8])
+        self.vars["computer_science_marks"].set(self.student_data[9])
 
     def _validate(self):
-        required_fields = ["roll_no", "student_name", "class_name", "section", "phone"]
+        required_fields = ["roll_no", "student_name", "class_name", "section"]
         for field in required_fields:
             if not self.vars[field].get().strip():
                 return False, "Please fill all required fields."
 
-        phone = self.vars["phone"].get().strip()
-        if not phone.isdigit() or len(phone) < 7 or len(phone) > 15:
-            return False, "Phone number must be 7 to 15 digits."
-
         marks = {}
-        for subject in SUBJECTS:
+        for subject, _ in SUBJECT_FIELDS:
             key = f"{subject}_marks"
             value = self.vars[key].get().strip()
             if value == "":
@@ -683,7 +837,6 @@ class StudentForm(tk.Toplevel):
             "student_name": self.vars["student_name"].get().strip(),
             "class_name": self.vars["class_name"].get().strip(),
             "section": self.vars["section"].get().strip(),
-            "phone": phone,
         }
         student.update(marks)
         return True, student
@@ -706,13 +859,264 @@ class StudentForm(tk.Toplevel):
             messagebox.showerror("Error", msg)
 
 
+class MultipleStudentsWindow(tk.Toplevel):
+    def __init__(self, master, db_manager, on_save=None):
+        super().__init__(master)
+        self.db = db_manager
+        self.on_save = on_save
+        self.title("Add Multiple Students")
+        self.geometry("1260x700")
+        self.minsize(1100, 620)
+        self.input_vars = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(expand=True, fill="both")
+
+        entry_frame = ttk.LabelFrame(main, text="Add Row", padding=10)
+        entry_frame.pack(fill="x", pady=(0, 10))
+
+        fields = [
+            ("roll_no", "Roll No"),
+            ("student_name", "Student Name"),
+            ("class_name", "Class"),
+            ("section", "Section"),
+            ("physics_marks", "Physics Marks"),
+            ("chemistry_marks", "Chemistry Marks"),
+            ("maths_marks", "Maths Marks"),
+            ("english_marks", "English Marks"),
+            ("computer_science_marks", "Computer Science Marks"),
+        ]
+
+        for index, (key, label) in enumerate(fields):
+            row = 0 if index < 5 else 1
+            col = (index % 5) * 2
+            ttk.Label(entry_frame, text=f"{label}:").grid(row=row, column=col, sticky="w", padx=4, pady=4)
+            var = tk.StringVar()
+            self.input_vars[key] = var
+            ttk.Entry(entry_frame, textvariable=var, width=18).grid(
+                row=row, column=col + 1, sticky="ew", padx=4, pady=4
+            )
+
+        for col in range(10):
+            entry_frame.columnconfigure(col, weight=1)
+
+        ttk.Button(entry_frame, text="Add Row", command=self.add_row).grid(
+            row=2, column=9, sticky="e", padx=4, pady=(8, 0)
+        )
+
+        buttons = ttk.Frame(main)
+        buttons.pack(fill="x", pady=(0, 8))
+        ttk.Button(buttons, text="Remove Selected Row", command=self.remove_selected_row).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(buttons, text="Clear All", command=self.clear_all_rows).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Save All Students", command=self.save_all_students).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+
+        table_frame = ttk.Frame(main)
+        table_frame.pack(expand=True, fill="both")
+
+        self.columns = [
+            "roll_no",
+            "student_name",
+            "class_name",
+            "section",
+            "physics_marks",
+            "chemistry_marks",
+            "maths_marks",
+            "english_marks",
+            "computer_science_marks",
+        ]
+        self.tree = ttk.Treeview(table_frame, columns=self.columns, show="headings", selectmode="extended")
+
+        headers = {
+            "roll_no": "Roll No",
+            "student_name": "Student Name",
+            "class_name": "Class",
+            "section": "Section",
+            "physics_marks": "Physics",
+            "chemistry_marks": "Chemistry",
+            "maths_marks": "Maths",
+            "english_marks": "English",
+            "computer_science_marks": "Computer Science",
+        }
+        widths = {
+            "roll_no": 120,
+            "student_name": 220,
+            "class_name": 90,
+            "section": 90,
+            "physics_marks": 100,
+            "chemistry_marks": 100,
+            "maths_marks": 100,
+            "english_marks": 100,
+            "computer_science_marks": 140,
+        }
+
+        for col in self.columns:
+            self.tree.heading(col, text=headers[col])
+            self.tree.column(col, width=widths[col], anchor="center")
+
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+    def _validate_student(self, student):
+        required_fields = ["roll_no", "student_name", "class_name", "section"]
+        for field in required_fields:
+            if not student[field].strip():
+                return "Required fields are missing."
+
+        for subject, _ in SUBJECT_FIELDS:
+            key = f"{subject}_marks"
+            value = student[key]
+            try:
+                mark = float(value)
+            except ValueError:
+                return "Marks must be numeric values."
+            if mark < 0 or mark > 100:
+                return "Marks must be between 0 and 100."
+            student[key] = mark
+        return None
+
+    def add_row(self):
+        student = {key: var.get().strip() for key, var in self.input_vars.items()}
+        error = self._validate_student(student)
+        if error:
+            messagebox.showerror("Validation Error", error)
+            return
+
+        self.tree.insert(
+            "",
+            "end",
+            values=(
+                student["roll_no"],
+                student["student_name"],
+                student["class_name"],
+                student["section"],
+                f"{student['physics_marks']:.2f}",
+                f"{student['chemistry_marks']:.2f}",
+                f"{student['maths_marks']:.2f}",
+                f"{student['english_marks']:.2f}",
+                f"{student['computer_science_marks']:.2f}",
+            ),
+        )
+
+        for key, var in self.input_vars.items():
+            if key in {"class_name", "section"}:
+                continue
+            var.set("")
+
+    def remove_selected_row(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Required", "Please select at least one row.")
+            return
+        for item in selected:
+            self.tree.delete(item)
+
+    def clear_all_rows(self):
+        if not self.tree.get_children():
+            return
+        if not messagebox.askyesno("Confirm", "Clear all pending rows?"):
+            return
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    def _extract_rows(self):
+        extracted = []
+        errors = {}
+        for index, item in enumerate(self.tree.get_children(), start=1):
+            values = self.tree.item(item, "values")
+            student = {
+                "roll_no": str(values[0]).strip(),
+                "student_name": str(values[1]).strip(),
+                "class_name": str(values[2]).strip(),
+                "section": str(values[3]).strip(),
+                "physics_marks": str(values[4]).strip(),
+                "chemistry_marks": str(values[5]).strip(),
+                "maths_marks": str(values[6]).strip(),
+                "english_marks": str(values[7]).strip(),
+                "computer_science_marks": str(values[8]).strip(),
+            }
+            error = self._validate_student(student)
+            if error:
+                errors[item] = f"Row {index}: {error}"
+            extracted.append((index, item, student))
+        return extracted, errors
+
+    def save_all_students(self):
+        if not self.tree.get_children():
+            messagebox.showwarning("No Data", "Please add at least one row before saving.")
+            return
+
+        rows, row_errors = self._extract_rows()
+
+        roll_to_items = defaultdict(list)
+        for row_number, item, student in rows:
+            roll_to_items[student["roll_no"]].append((row_number, item))
+
+        for roll, entries in roll_to_items.items():
+            if len(entries) > 1:
+                for row_number, item in entries:
+                    row_errors[item] = f"Row {row_number}: Duplicate roll number '{roll}' in current batch."
+
+        existing_rolls = self.db.find_existing_roll_numbers([student["roll_no"] for _, _, student in rows])
+        for row_number, item, student in rows:
+            if item in row_errors:
+                continue
+            if student["roll_no"] in existing_rolls:
+                row_errors[item] = (
+                    f"Row {row_number}: Roll number '{student['roll_no']}' already exists in database."
+                )
+
+        valid_students = [student for _, item, student in rows if item not in row_errors]
+        added_count = 0
+        if valid_students:
+            try:
+                added_count = self.db.add_students_bulk(valid_students)
+            except sqlite3.IntegrityError:
+                messagebox.showerror(
+                    "Insert Error",
+                    "Bulk insert failed due to duplicate roll numbers. Please review and try again.",
+                )
+                return
+
+        for _, item, _student in rows:
+            if item not in row_errors:
+                self.tree.delete(item)
+
+        if self.on_save:
+            self.on_save()
+
+        if row_errors:
+            ordered_errors = [row_errors[item] for item in self.tree.get_children() if item in row_errors]
+            remaining_errors = [msg for item, msg in row_errors.items() if item not in self.tree.get_children()]
+            error_text = "\n".join(ordered_errors + remaining_errors)
+            messagebox.showwarning(
+                "Save Completed with Issues",
+                f"Successfully added {added_count} student(s).\n\nIssues:\n{error_text}",
+            )
+        else:
+            messagebox.showinfo("Success", f"Successfully added {added_count} student(s).")
+
+
 class ReportCardWindow(tk.Toplevel):
     def __init__(self, master, student):
         super().__init__(master)
         self.student = student
         self.title("Report Card")
-        self.geometry("540x540")
-        self.minsize(500, 500)
+        self.geometry("540x560")
+        self.minsize(500, 520)
         self._build_ui()
 
     def _build_ui(self):
@@ -730,14 +1134,15 @@ class ReportCardWindow(tk.Toplevel):
 
         marks_frame = ttk.LabelFrame(frame, text="Subject Marks", padding=10)
         marks_frame.pack(fill="x", pady=(0, 10))
-        subject_labels = ["English", "Maths", "Science", "Social", "Computer"]
-        values = self.student[6:11]
+
+        subject_labels = [label for _, label in SUBJECT_FIELDS]
+        values = self.student[5:10]
         for index, (label, value) in enumerate(zip(subject_labels, values)):
             ttk.Label(marks_frame, text=f"{label}: {value}").grid(
                 row=index, column=0, sticky="w", pady=2
             )
 
-        total_marks = sum(float(v) for v in values)
+        total_marks = float(self.student[10])
         summary = (
             f"Total Marks: {total_marks:.2f}/500\n"
             f"Average Marks: {float(self.student[11]):.2f}\n"
@@ -755,9 +1160,9 @@ class ReportCardWindow(tk.Toplevel):
     def print_report(self):
         file_name = f"report_card_{self.student[1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         file_path = os.path.join(os.getcwd(), file_name)
-        subject_labels = ["English", "Maths", "Science", "Social", "Computer"]
-        values = self.student[6:11]
-        total_marks = sum(float(v) for v in values)
+        subject_labels = [label for _, label in SUBJECT_FIELDS]
+        values = self.student[5:10]
+        total_marks = float(self.student[10])
 
         lines = [
             "=" * 46,
